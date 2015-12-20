@@ -17,7 +17,9 @@
 
 #include <sys/queue.h>
 #include <sys/tree.h>
+#include <net/if.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <assert.h>
 #include <endian.h>
 #include <err.h>
@@ -44,10 +46,12 @@ static struct {
     evutil_socket_t socket;
     struct event    *read_ev;
     struct event    *write_ev;
+    struct ifaddrs  *ifap;
 } lgtd_lifx_broadcast_endpoint = {
     .socket = -1,
     .read_ev = NULL,
     .write_ev = NULL,
+    .ifap = NULL,
 };
 
 static bool
@@ -70,23 +74,43 @@ lgtd_lifx_broadcast_handle_write(void)
         LGTD_LIFX_GET_PAN_GATEWAY
     );
 
-    int nbytes;
+    int nbytes, nbytes_max = 0;
 retry:
-    nbytes = sendto(
-        lgtd_lifx_broadcast_endpoint.socket,
-        (void *)&get_pan_gateway,
-        sizeof(get_pan_gateway),
-        0,
-        (const struct sockaddr *)&lifx_addr,
-        sizeof(lifx_addr)
-    );
-    if (nbytes == sizeof(get_pan_gateway)) {
+    if (lgtd_lifx_broadcast_endpoint.ifap == NULL)
+        nbytes_max = sendto(
+            lgtd_lifx_broadcast_endpoint.socket,
+            (void *)&get_pan_gateway,
+            sizeof(get_pan_gateway),
+            0,
+            (const struct sockaddr *)&lifx_addr,
+            sizeof(lifx_addr)
+        );
+    else
+        for (struct ifaddrs *ifa = lgtd_lifx_broadcast_endpoint.ifap;
+             ifa != NULL; ifa = ifa->ifa_next)
+        {
+            if (ifa->ifa_broadaddr == NULL ||
+                !(ifa->ifa_flags & IFF_BROADCAST) ||
+                ifa->ifa_netmask == NULL)
+                continue;
+            lifx_addr.sin_addr = ((struct sockaddr_in*)ifa->ifa_broadaddr)->sin_addr;
+            nbytes = sendto(
+                lgtd_lifx_broadcast_endpoint.socket,
+                (void *)&get_pan_gateway,
+                sizeof(get_pan_gateway),
+                0,
+                (const struct sockaddr *)&lifx_addr,
+                sizeof(lifx_addr)
+            );
+            nbytes_max = nbytes_max > nbytes ? nbytes_max : nbytes;
+        }
+    if (nbytes_max == sizeof(get_pan_gateway)) {
         if (event_del(lgtd_lifx_broadcast_endpoint.write_ev)) {
             lgtd_err(1, "can't setup events");
         }
         return true;
     }
-    if (nbytes == -1) {
+    if (nbytes_max == -1) {
         if (EVUTIL_SOCKET_ERROR() == EINTR) {
             goto retry;
         }
@@ -141,6 +165,10 @@ lgtd_lifx_broadcast_close(void)
         evutil_closesocket(lgtd_lifx_broadcast_endpoint.socket);
         lgtd_lifx_broadcast_endpoint.socket = -1;
     }
+    if (lgtd_lifx_broadcast_endpoint.ifap != NULL) {
+        freeifaddrs(lgtd_lifx_broadcast_endpoint.ifap);
+        lgtd_lifx_broadcast_endpoint.ifap = NULL;
+    }
 }
 
 bool
@@ -149,6 +177,7 @@ lgtd_lifx_broadcast_setup(void)
     assert(lgtd_lifx_broadcast_endpoint.socket == -1);
     assert(lgtd_lifx_broadcast_endpoint.read_ev == NULL);
     assert(lgtd_lifx_broadcast_endpoint.write_ev == NULL);
+    assert(lgtd_lifx_broadcast_endpoint.ifap == NULL);
 
     lgtd_lifx_broadcast_endpoint.socket = socket(
         AF_INET, SOCK_DGRAM, IPPROTO_UDP
@@ -194,6 +223,12 @@ lgtd_lifx_broadcast_setup(void)
     );
     if (err) {
         goto error;
+    }
+
+    err = getifaddrs(&lgtd_lifx_broadcast_endpoint.ifap);
+    if (err) {
+        lgtd_warn("can't get interfaces list for broadcast,"
+                  "will only broadcast to the default interface");
     }
 
     lgtd_lifx_broadcast_endpoint.read_ev = event_new(
